@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Simple AI Chat (SSE)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="min-h-screen bg-slate-50">
+<div class="mx-auto max-w-3xl px-4 py-6">
+    <!-- Header -->
+    <div class="flex items-center justify-between">
+        <div>
+            <h1 class="text-xl font-semibold text-slate-900">AI 对话</h1>
+            <p class="text-sm text-slate-500">EventSource + Spring AI 流式 GET（SSE）</p>
+        </div>
+        <div class="flex items-center gap-2">
+            <span id="statusDot" class="h-2.5 w-2.5 rounded-full bg-slate-300"></span>
+            <span id="statusText" class="text-sm text-slate-600">Idle</span>
+        </div>
+    </div>
+
+    <!-- Chat panel -->
+    <div class="mt-4 rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <div id="chat"
+             class="h-[60vh] overflow-y-auto px-4 py-4 space-y-3">
+            <!-- messages appended here -->
+            <div class="text-sm text-slate-400">
+                请输入内容并发送。流式输出会逐字追加到最后一条 assistant 消息中。
+            </div>
+        </div>
+
+        <!-- Composer -->
+        <div class="border-t border-slate-200 p-3">
+            <div class="flex flex-col gap-2">
+                <div class="flex gap-2">
+                    <label class="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">
+                        <span class="text-slate-500">模型</span>
+                        <input id="modelInput"
+                               class="w-56 bg-transparent outline-none placeholder:text-slate-400"
+                               value="deepseek-r1:1.5b"
+                               placeholder="例如 deepseek-r1:1.5b" />
+                    </label>
+
+                    <button id="clearBtn"
+                            class="ml-auto rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 active:scale-[0.99]">
+                        清空
+                    </button>
+
+                    <button id="stopBtn"
+                            class="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700 hover:bg-rose-100 active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed"
+                            disabled>
+                        停止
+                    </button>
+                </div>
+
+                <div class="flex gap-2">
+            <textarea id="msgInput"
+                      rows="2"
+                      class="flex-1 resize-none rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 shadow-sm outline-none focus:ring-2 focus:ring-slate-200"
+                      placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+
+                    <button id="sendBtn"
+                            class="w-28 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-medium text-white shadow-sm hover:bg-slate-800 active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed">
+                        发送
+                    </button>
+                </div>
+
+                <div class="flex items-center justify-between text-xs text-slate-500">
+                    <span>接口：<code class="rounded bg-slate-100 px-1 py-0.5">/api/v1/ollama/generate_stream</code></span>
+                    <span id="hint" class="text-slate-400"></span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <footer class="mt-4 text-center text-xs text-slate-400">
+        注意：EventSource 只能 GET；message 会自动 URL 编码；服务端需返回 text/event-stream。
+    </footer>
+</div>
+
+<script>
+    // ====== 可按需修改：服务端地址（同域可留空）======
+    const BASE_URL = "http://localhost:8090"; // 例如 "http://localhost:8090"
+    const API_PATH = "/api/v1/ollama/generate_stream";
+
+    // ====== DOM ======
+    const chatEl = document.getElementById("chat");
+    const modelInput = document.getElementById("modelInput");
+    const msgInput = document.getElementById("msgInput");
+    const sendBtn = document.getElementById("sendBtn");
+    const clearBtn = document.getElementById("clearBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const statusDot = document.getElementById("statusDot");
+    const statusText = document.getElementById("statusText");
+    const hintEl = document.getElementById("hint");
+
+    // ====== State ======
+    let eventSource = null;
+    let currentAssistantMsgEl = null;
+    let streaming = false;
+
+    // ====== Utils ======
+    function setStatus(state, text) {
+        // state: idle | connecting | streaming | error | done
+        const colorMap = {
+            idle: "bg-slate-300",
+            connecting: "bg-amber-400",
+            streaming: "bg-emerald-400",
+            error: "bg-rose-500",
+            done: "bg-sky-400"
+        };
+        statusDot.className = `h-2.5 w-2.5 rounded-full ${colorMap[state] || "bg-slate-300"}`;
+        statusText.textContent = text || state;
+    }
+
+    function scrollToBottom() {
+        chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    function escapeHtml(str) {
+        return str
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#039;");
+    }
+
+    function appendMessage(role, text) {
+        const isUser = role === "user";
+        const wrapper = document.createElement("div");
+        wrapper.className = `flex ${isUser ? "justify-end" : "justify-start"}`;
+
+        const bubble = document.createElement("div");
+        bubble.className = [
+            "max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-relaxed",
+            isUser
+                ? "bg-slate-900 text-white"
+                : "bg-slate-100 text-slate-900 border border-slate-200"
+        ].join(" ");
+
+        // 支持换行显示
+        bubble.innerHTML = escapeHtml(text).replaceAll("\n", "<br/>");
+
+        wrapper.appendChild(bubble);
+        chatEl.appendChild(wrapper);
+        scrollToBottom();
+        return bubble; // 返回 bubble，方便后续流式追加
+    }
+
+    function setUiStreaming(on) {
+        streaming = on;
+        sendBtn.disabled = on;
+        stopBtn.disabled = !on;
+        msgInput.disabled = on;
+        modelInput.disabled = on;
+    }
+
+    function buildApiUrl(model, message) {
+        const params = new URLSearchParams();
+        params.set("model", model);
+        params.set("message", message);
+        return `${BASE_URL}${API_PATH}?${params.toString()}`;
+    }
+
+    function stopStream(reason = "Stopped") {
+        if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+        }
+        setUiStreaming(false);
+        setStatus("done", reason);
+        hintEl.textContent = "";
+        currentAssistantMsgEl = null;
+    }
+
+    // 尝试从 payload（对象或数组）中抽取 content / finishReason
+    function extractChunks(payload) {
+        const items = Array.isArray(payload) ? payload : [payload];
+        const out = [];
+
+        for (const it of items) {
+            const content = it?.result?.output?.content ?? "";
+            const finishReason = it?.result?.metadata?.finishReason ?? null;
+            out.push({ content, finishReason });
+        }
+        return out;
+    }
+
+    // 兼容某些 SSE 会把 data 分多行拼起来
+    function safeJsonParse(str) {
+        try { return JSON.parse(str); } catch (_) { return null; }
+    }
+
+    // ====== Core: start streaming ======
+    function startStream(model, message) {
+        // UI：先写入 user + assistant 占位
+        appendMessage("user", message);
+        currentAssistantMsgEl = appendMessage("assistant", "");
+
+        const apiUrl = buildApiUrl(model, message);
+        hintEl.textContent = apiUrl;
+
+        setUiStreaming(true);
+        setStatus("connecting", "Connecting");
+
+        // 重要：EventSource 只能 GET
+        eventSource = new EventSource(apiUrl);
+
+        eventSource.onopen = () => {
+            setStatus("streaming", "Streaming");
+        };
+
+        eventSource.onmessage = (evt) => {
+            // evt.data 可能是一段 JSON，也可能是多个 JSON 拼接（少见），这里按“先整体 parse”策略处理
+            // 若整体 parse 失败，则尝试按行拆
+            const raw = (evt?.data ?? "").trim();
+            if (!raw) return;
+
+            let payload = safeJsonParse(raw);
+
+            if (!payload) {
+                // 兜底：按行拆，寻找能 parse 的 JSON
+                const lines = raw.split("\n").map(s => s.trim()).filter(Boolean);
+                for (const line of lines) {
+                    const p = safeJsonParse(line);
+                    if (p) {
+                        payload = p;
+                        break;
+                    }
+                }
+            }
+
+            if (!payload) {
+                // 还是不行，就忽略这帧（或你也可以打印到 console）
+                console.warn("Unparsable SSE data:", raw);
+                return;
+            }
+
+            const chunks = extractChunks(payload);
+
+            for (const { content, finishReason } of chunks) {
+                // content 可能为空：空就不追加
+                if (typeof content === "string" && content.length > 0 && currentAssistantMsgEl) {
+                    // 追加时保持换行显示
+                    const prev = currentAssistantMsgEl.innerText; // innerText 获取“实际文本”
+                    const next = prev + content;
+                    currentAssistantMsgEl.innerHTML = escapeHtml(next).replaceAll("\n", "<br/>");
+                    scrollToBottom();
+                }
+
+                // 结束标识：finishReason = STOP
+                if (finishReason === "STOP") {
+                    stopStream("Done");
+                    return;
+                }
+            }
+        };
+
+        eventSource.onerror = (err) => {
+            console.error("EventSource error:", err);
+            // EventSource 出错通常会自动重连；但你这里更像一次性对话流式，出错就收口
+            setStatus("error", "Error");
+            stopStream("Error/Disconnected");
+        };
+    }
+
+    // ====== UI bindings ======
+    sendBtn.addEventListener("click", () => {
+        const model = modelInput.value.trim() || "deepseek-r1:1.5b";
+        const message = msgInput.value.trim();
+        if (!message || streaming) return;
+        msgInput.value = "";
+        startStream(model, message);
+    });
+
+    stopBtn.addEventListener("click", () => {
+        if (!streaming) return;
+        stopStream("Stopped");
+    });
+
+    clearBtn.addEventListener("click", () => {
+        if (streaming) stopStream("Stopped");
+        chatEl.innerHTML = `
+        <div class="text-sm text-slate-400">
+          请输入内容并发送。流式输出会逐字追加到最后一条 assistant 消息中。
+        </div>
+      `;
+    });
+
+    // Enter 发送；Shift+Enter 换行
+    msgInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            sendBtn.click();
+        }
+    });
+
+    // init
+    setStatus("idle", "Idle");
+</script>
+</body>
+</html>
