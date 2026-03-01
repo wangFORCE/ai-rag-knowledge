@@ -138,6 +138,7 @@ public class RAGController implements IRAGService {
         git.close();
         log.info("遍历解析路径，上传完成:{}", repoUrl);
 
+        // 是在调用一个静态泛型方法时,  显示指定泛型参数
         return Response.<String>builder()
                 .code("0000")
                 .info("调用成功").build();
