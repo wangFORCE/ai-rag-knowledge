@@ -34,6 +34,14 @@ spring:
         options:
           num-batch: 512
         model: nomic-embed-text
+    openai:
+      base-url: https://pro-share-aws-api.zcyai.com/
+      api-key: sk-eEyfxptPgbfXd3Z164260740E0494161Bd8
+      embedding:
+        options:
+          model: text-embedding-ada-002
+    rag:
+      embed: nomic-embed-text
 
 # Redis
 redis:
